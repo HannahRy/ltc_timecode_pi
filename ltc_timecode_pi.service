@@ -1,0 +1,15 @@
+[Unit]
+Description=LTC Timecode Generator (ALSA, libltc)
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ltc_timecode_pi --quiet
+Restart=on-failure
+User=ltc
+
+# For real-time priority, you may need to add capability
+AmbientCapabilities=CAP_SYS_NICE
+
+[Install]
+WantedBy=multi-user.target
