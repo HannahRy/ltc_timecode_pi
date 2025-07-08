@@ -1,0 +1,9 @@
+[Unit]
+Description=Delay ltc_timecode_pi startup after boot
+
+[Timer]
+OnBootSec=60s
+Unit=ltc_timecode_pi.service
+
+[Install]
+WantedBy=timers.target

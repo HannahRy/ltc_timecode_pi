@@ -1,2 +1,49 @@
-device=hw:CARD=Device,DEV=0
-framerate=29.97df
+# LTC Timecode Generator Configuration File
+# Copy this to /etc/ltc_timecode_pi.conf
+# All settings are optional and will use program defaults if not specified
+
+#---------- Audio Output Settings ----------#
+
+# ALSA Device 
+# Use 'aplay -L' to list available devices
+# Common examples:
+#   "default" - System default audio device
+#   "hw:0,0" - First hardware device, first sub-device
+#   "hw:CARD=PCH,DEV=0" - Specific card by name
+# Default: "default"
+device=default
+
+#---------- Timecode Settings ----------#
+
+# Frame rate
+# Options: 
+#   24     - 24 fps (film)
+#   25     - 25 fps (PAL/SECAM)
+#   29.97  - 29.97 fps (NTSC non-drop)
+#   30     - 30 fps (NTSC)
+#   29.97df - 29.97 fps drop-frame
+#   30df   - 30 fps drop-frame
+# Default: 25
+framerate=25
+
+#---------- Time Synchronization ----------#
+
+# NTP Server
+# Set a hostname or IP address of an NTP server
+# Uncomment to enable NTP synchronization
+# Leave commented out to use system clock
+#ntp-server=pool.ntp.org
+
+# NTP synchronization interval in seconds
+# How often to query the NTP server
+# Range: 10-3600 (seconds)
+# Default: 60
+#ntp-sync-interval=60
+
+# NTP slew period in seconds
+# Period over which to gradually adjust time to match NTP
+# Higher values give smoother adjustments but slower convergence
+# Lower values make faster corrections but may cause audible time jumps
+# Range: 1-300 (seconds)
+# Default: 30
+#ntp-slew-period=30

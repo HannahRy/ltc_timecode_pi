@@ -5,15 +5,16 @@
 ## Features
 
 - Real-time, sample-accurate Linear Timecode (LTC) audio generation
-- Accurate system time sync with ALSA buffer latency compensation
+- Accurate system time sync with adaptive ALSA buffer latency compensation
+- Advanced non-linear timing correction for improved frame accuracy
+- Memory locking to prevent paging-related timing issues
 - Supports all standard SMPTE framerates (24, 25, 29.97, 30, drop-frame and non-drop-frame)
-- Pinned to a CPU core for deterministic scheduling
-- Graceful exit on Ctrl+C or SIGTERM
+- CPU core pinning for deterministic scheduling
 - Real-time priority for glitch-free audio
 - Console display of running timecode, live-updated (suppressed when running as a service or with `--quiet`)
-- Selectable ALSA audio device via command-line option
+- Selectable ALSA audio device
 - Can be installed as a systemd service for automatic startup
-- Tested on Raspberry Pi 2 with onboard audio
+- Currently tested on Raspberry Pi 2 with onboard audio
 
 ## Disclaimer
 
@@ -51,13 +52,16 @@ This will produce the `ltc_timecode_pi` executable.
 ## Usage
 
 ```sh
-./ltc_timecode_pi [-q] [-d device] [frame_rate] [--config <file>]
+./ltc_timecode_pi [options]
 ```
 
 - `-q`, `--quiet` : Suppress console timecode output (recommended for service/systemd use)
 - `-d`, `--device` : ALSA PCM device string (default: `default`)
 - `frame_rate` : One of `24`, `25`, `29.97`, `30`, `29.97df`, `30df` (default: `25`)
 - `--config <file>` : Path to config file (default: `/etc/ltc_timecode_pi.conf`)
+- `--ntp-server <host>` : Use specified NTP server for time synchronization
+- `--ntp-sync-interval <seconds>` : NTP sync interval in seconds (default: 60)
+- `--ntp-slew-period <seconds>` : Period over which to gradually adjust time (default: 30)
 
 ### List Available ALSA Devices
 
@@ -84,6 +88,47 @@ Suppress console output (useful for daemon/service/systemd):
 ./ltc_timecode_pi --quiet
 ```
 
+## Configuration File
+
+The configuration file (default: `/etc/ltc_timecode_pi.conf`) allows you to set persistent options. Command-line arguments override config file values.
+
+Example config file:
+```
+device=hw:CARD=Device,DEV=0         # ALSA device name
+framerate=30                        # Frame rate (24, 25, 29.97, 30, 29.97df, 30df)
+cpu-core=3                          # CPU core to pin process to (use -1 to disable)
+ntp-server=pool.ntp.org             # NTP server for time synchronization
+ntp-sync-interval=60                # NTP sync interval in seconds
+ntp-slew-period=30                  # Time adjustment period in seconds
+```
+
+- Use `aplay -L` to list available ALSA devices.
+- You can specify a different config file with `--config <file>`.
+
+## NTP Time Synchronization
+
+By default, LTC timecode is generated based on the system clock. For more precise and accurate time synchronization, you can specify an NTP server. This is designed to connect to a GPS/PPS NTP server on the local network for low latency.
+
+Enable NTP sync:
+```sh
+./ltc_timecode_pi --ntp-server pool.ntp.org
+```
+
+Configure NTP sync interval and slew period:
+```sh
+./ltc_timecode_pi --ntp-server pool.ntp.org --ntp-sync-interval 300 --ntp-slew-period 60
+```
+
+Or set these in the config file:
+```
+ntp-server=time.google.com
+ntp-sync-interval=300  # sync every 5 minutes
+ntp-slew-period=60     # gradually adjust time over 60 seconds
+```
+
+- The program will sync with the NTP server at startup and periodically based on the configured interval.
+- For best results, use a stratum 1 timeserver or a local NTP server with good accuracy.
+
 ## Notes
 
 - For improved real-time performance, you can isolate a CPU core by adding `isolcpus=3` to `/boot/firmware/cmdline.txt` on your Raspberry Pi. This reserves core 3 for real-time tasks and can help reduce audio glitches.
@@ -93,13 +138,7 @@ Suppress console output (useful for daemon/service/systemd):
   sudo setcap 'cap_sys_nice=eip' ./ltc_timecode_pi
   ```
 - If the program cannot set real-time priority, it will print a warning and continue.
-- You can set the ALSA device and framerate in a config file (default: `/etc/ltc_timecode_pi.conf`) using key=value format:
-  ```
-  device=hw:CARD=Device,DEV=0
-  framerate=29.97df
-  ```
-- Use the `--config <file>` argument to specify a different config file.
-- Command-line arguments override config file values.
+- Command-line arguments always override config file values.
 
 ## Installing as a systemd Service
 
@@ -112,32 +151,45 @@ You can install and enable `ltc_timecode_pi` as a systemd service using the prov
    This will:
    - Build and copy the `ltc_timecode_pi` binary to `/usr/local/bin/`
    - Install the systemd service file to `/etc/systemd/system/ltc_timecode_pi.service`
-   - Create a system user `ltc` (if it does not already exist) for the service to run as
+   - Install a systemd timer to `/etc/systemd/system/ltc_timecode_pi.timer` (for delayed startup)
+   - Install an example config file to `/etc/ltc_timecode_pi.conf` (if it doesn't exist)
+   - Create a system user `ltc` (if it doesn't exist) and add it to the audio group
    - Reload systemd units
 
-2. **Enable and start the service:**
+2. **Enable and start the timer for boot autostart:**
    ```sh
-   sudo systemctl enable ltc_timecode_pi
-   sudo systemctl start ltc_timecode_pi
+   sudo systemctl enable ltc_timecode_pi.timer
+   sudo systemctl start ltc_timecode_pi.timer
+   ```
+   This will start the service with a delay after boot to ensure the sound system is ready.
+
+3. **Or start the service immediately without the timer:**
+   ```sh
+   sudo systemctl start ltc_timecode_pi.service
    ```
 
-3. **Check service status:**
+4. **Check service/timer status:**
    ```sh
-   sudo systemctl status ltc_timecode_pi
+   sudo systemctl status ltc_timecode_pi.service
+   sudo systemctl status ltc_timecode_pi.timer
    ```
 
-4. **View logs:**
+5. **View logs:**
    ```sh
    journalctl -u ltc_timecode_pi
    ```
 
-You can adjust the service file at `/etc/systemd/system/ltc_timecode_pi.service` as needed for your setup (e.g., to specify a config file or device).
+6. **Uninstall if needed:**
+   ```sh
+   sudo make uninstall
+   ```
+   This will stop and disable the service and timer, and remove all installed files.
 
-## Clean Up
+You can adjust the configuration at `/etc/ltc_timecode_pi.conf` to set your device, framerate, and NTP server.
 
-```sh
-make clean
-```
+## Technical Details: Timing Correction
+
+For an in-depth explanation of the advanced timing correction techniques used to achieve precise LTC output—including hardware optimizations, ALSA buffer compensation, and adaptive mathematical correction—see [docs/TIMING.md](docs/TIMING.md).
 
 ## License
 

@@ -9,9 +9,10 @@
  * - Real-time priority for audio thread
  * - Audio interface can be selected with -d or --device option
  * - Console timecode output is only shown when run directly (not as a systemd service or with --quiet)
+ * - NTP synchronization with multiple-query best-offset selection
  *
  * Compile:
- *   gcc -pthread -o ltc_timecode_pi ltc_timecode_pi.c -lltc -lasound -lm
+ *   gcc -pthread -o ltc_timecode_pi ltc_timecode_pi.c ltc_timecode.c ltc_ntp.c ltc_config.c -lltc -lasound -lm
  *
  * Usage:
  *   ./ltc_timecode_pi [-q] [-d device] [frame_rate]
@@ -23,216 +24,42 @@
  *   aplay -L
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <sched.h>
-#include <time.h>
 #include <string.h>
-#include <ltc.h>
-#include <alsa/asoundlib.h>
-#include <limits.h>
-#include <pthread.h>
 #include <unistd.h>
-#include <math.h>
-#include <sys/time.h>
 #include <signal.h>
-#include <errno.h>
 #include <getopt.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
+#include <limits.h>
+#include <math.h>
+#include <inttypes.h>
+#include <sys/mman.h> // For mlockall
 
-// Some libltc installs do not define LTC_TV_STANDARD, use int instead and define constants
-#ifndef LTC_TV_525_60
-#define LTC_TV_525_60 0
-#endif
-#ifndef LTC_TV_625_50
-#define LTC_TV_625_50 1
-#endif
+#include "ltc_common.h"
+#include "ltc_ntp.h"
+#include "ltc_config.h"
 
-#define SAMPLE_RATE 48000
-#define DEFAULT_PCM_DEVICE "default"
-#define CHANNELS 1
-#define DEFAULT_CONFIG_FILE "/etc/ltc_timecode_pi.conf"
-#define MAX_LINE 256
-
-typedef struct {
-    double fps;
-    int std;         // Use int instead of LTC_TV_STANDARD for compatibility
-    int drop_frame;
-    const char* name;
-} framerate_spec_t;
-
-// Supported rates
-static const framerate_spec_t supported_rates[] = {
-    {24.0,    LTC_TV_525_60, 0, "24"},
-    {25.0,    LTC_TV_625_50, 0, "25"},
-    {29.97,   LTC_TV_525_60, 0, "29.97"},
-    {30.0,    LTC_TV_525_60, 0, "30"},
-    {29.97,   LTC_TV_525_60, 1, "29.97df"},
-    {30.0,    LTC_TV_525_60, 1, "30df"}
-};
-
-#define NUM_SUPPORTED_RATES (sizeof(supported_rates)/sizeof(supported_rates[0]))
-
-// Shared state for timecode display thread
-typedef struct {
-    pthread_mutex_t lock;
-    SMPTETimecode tc;
-    double fps;
-    int drop_frame;
-    int running;
-} timecode_display_state_t;
-
-volatile sig_atomic_t running = 1;
+// Global variables required by header files
+int use_ntp = 0;
+int64_t ntp_offset_us = 0;
+int64_t ntp_target_offset_us = 0;
+pthread_mutex_t ntp_lock = PTHREAD_MUTEX_INITIALIZER;
+double selected_fps = 25.0;  // Default frame rate, will be updated when actual rate is known
 
 void handle_signal(int signo) {
     running = 0;
 }
 
-void format_timecode(char *buf, size_t n, const SMPTETimecode *tc, double fps, int drop_frame) {
-    if (drop_frame) {
-        snprintf(buf, n, "\r%02d:%02d:%02d;%02d @ %.3f fps",
-            tc->hours, tc->mins, tc->secs, tc->frame, fps);
+// Lock memory to prevent paging which can cause latency spikes
+static void lock_memory(void) {
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0) {
+        fprintf(stderr, "Warning: Failed to lock memory: %s\n", strerror(errno));
     } else {
-        snprintf(buf, n, "\r%02d:%02d:%02d:%02d @ %.3f fps",
-            tc->hours, tc->mins, tc->secs, tc->frame, fps);
+        fprintf(stderr, "Memory locked successfully (prevents paging)\n");
     }
-}
-
-// Pin process to CPU core (core_id is 0-based)
-void pin_to_core(int core_id) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
-    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-}
-
-// Print usage and supported rates
-void print_usage(const char* prog) {
-    fprintf(stderr, "Usage: %s [-q] [-d device] [frame_rate]\n", prog);
-    fprintf(stderr, "  -q, --quiet    Suppress console timecode output (recommended for service)\n");
-    fprintf(stderr, "  -d, --device   ALSA PCM device string (default: \"default\")\n");
-    fprintf(stderr, "Supported frame rates:\n");
-    for (size_t i = 0; i < NUM_SUPPORTED_RATES; ++i) {
-        fprintf(stderr, "  %s\n", supported_rates[i].name);
-    }
-}
-
-// Find framerate_spec_t from arg, or NULL if not found
-const framerate_spec_t* parse_rate(const char* arg) {
-    for (size_t i = 0; i < NUM_SUPPORTED_RATES; ++i) {
-        if (strcmp(arg, supported_rates[i].name) == 0)
-            return &supported_rates[i];
-    }
-    return NULL;
-}
-
-// Fill SMPTETimecode from adjusted system clock (with ALSA buffer delay compensation)
-void get_timecode_with_alsa_latency(SMPTETimecode *tc, double fps, snd_pcm_t *pcm, int drop_frame) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-
-    // Query output latency in frames
-    snd_pcm_sframes_t delay_frames = 0;
-    if (snd_pcm_delay(pcm, &delay_frames) < 0) {
-        delay_frames = 0;
-    }
-    double buffer_delay_sec = delay_frames / (double)SAMPLE_RATE;
-    // Adjust system time by buffer latency
-    double adj_sec = ts.tv_sec + ts.tv_nsec / 1e9 + buffer_delay_sec;
-    time_t adj_whole = (time_t)adj_sec;
-    double adj_frac = adj_sec - adj_whole;
-    struct tm *tm = localtime(&adj_whole);
-
-    tc->years   = tm->tm_year + 1900;
-    tc->months  = tm->tm_mon + 1;
-    tc->days    = tm->tm_mday;
-    tc->hours   = tm->tm_hour;
-    tc->mins    = tm->tm_min;
-    tc->secs    = tm->tm_sec;
-
-    // SMPTE drop-frame for 29.97/30DF: frames 0 and 1 are dropped at the top of each minute except every tenth
-    int frame = (int)round(adj_frac * fps);
-
-    if (drop_frame) {
-        int d = 2; // always 2 frames dropped per minute
-        if ((tc->mins % 10) != 0 && frame < d) {
-            frame = d;
-        }
-        if (frame >= (int)fps) frame = (int)fps - 1;
-    } else {
-        if (frame >= (int)fps) frame = (int)fps - 1;
-    }
-    tc->frame = frame;
-}
-
-// Low-priority thread to display timecode on the console
-void* timecode_display_thread(void *arg) {
-    timecode_display_state_t *display = (timecode_display_state_t*)arg;
-
-#ifdef SCHED_IDLE
-    struct sched_param param;
-    param.sched_priority = 0;
-    pthread_setschedparam(pthread_self(), SCHED_IDLE, &param);
-#endif
-
-    char buf[80];
-    SMPTETimecode last_tc = {0};
-
-    while (display->running) {
-        pthread_mutex_lock(&display->lock);
-        if (memcmp(&display->tc, &last_tc, sizeof(SMPTETimecode)) != 0) {
-            format_timecode(buf, sizeof(buf), &display->tc, display->fps, display->drop_frame);
-            fwrite(buf, 1, strlen(buf), stdout);
-            fflush(stdout);
-            last_tc = display->tc;
-        }
-        pthread_mutex_unlock(&display->lock);
-        usleep(1000); // 1ms
-    }
-    printf("\n");
-    return NULL;
-}
-
-void set_realtime_priority(void) {
-    struct sched_param sp;
-    sp.sched_priority = 20; // 1-99 (99=highest), 20 is safe for non-root, adjust as needed
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-        fprintf(stderr, "Warning: Failed to set real-time priority for audio thread: %s\n", strerror(errno));
-    }
-}
-
-// Return 1 if attached to a terminal, 0 otherwise
-int is_console_interactive(void) {
-    // Only consider interactive if stdout is a tty and not running under systemd
-    return isatty(STDOUT_FILENO) && (getenv("INVOCATION_ID") == NULL);
-}
-
-char config_device[128] = "";
-char config_framerate[32] = "";
-
-void parse_config(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    if (!f) return;
-    char line[MAX_LINE];
-    while (fgets(line, sizeof(line), f)) {
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = 0;
-        char *key = line;
-        char *val = eq + 1;
-        // Remove trailing newline
-        val[strcspn(val, "\r\n")] = 0;
-        if (strcmp(key, "device") == 0) {
-            strncpy(config_device, val, sizeof(config_device)-1);
-        } else if (strcmp(key, "framerate") == 0) {
-            strncpy(config_framerate, val, sizeof(config_framerate)-1);
-        }
-    }
-    fclose(f);
 }
 
 int main(int argc, char *argv[]) {
@@ -249,12 +76,33 @@ int main(int argc, char *argv[]) {
         {"quiet",  no_argument,       0, 'q'},
         {"device", required_argument, 0, 'd'},
         {"config", required_argument, 0,  0 },
+        {"ntp-server", required_argument, 0, 0 },
+        {"ntp-sync-interval", required_argument, 0, 0 },
+        {"ntp-slew-period", required_argument, 0, 0 },
         {0, 0, 0, 0}
     };
     while ((opt = getopt_long(argc, argv, "qd:", long_options, &opt_index)) != -1) {
-        if (opt == 0 && strcmp(long_options[opt_index].name, "config") == 0) {
-            strncpy(config_file, optarg, sizeof(config_file)-1);
-            config_file[sizeof(config_file)-1] = 0;
+        if (opt == 0) {
+            if (strcmp(long_options[opt_index].name, "config") == 0) {
+                strncpy(config_file, optarg, sizeof(config_file)-1);
+                config_file[sizeof(config_file)-1] = 0;
+            } else if (strcmp(long_options[opt_index].name, "ntp-server") == 0) {
+                strncpy(ntp_server, optarg, sizeof(ntp_server)-1);
+                ntp_server[sizeof(ntp_server)-1] = 0;
+                use_ntp = 1;
+            } else if (strcmp(long_options[opt_index].name, "ntp-sync-interval") == 0) {
+                ntp_sync_interval = atoi(optarg);
+                if (ntp_sync_interval < 1) {
+                    fprintf(stderr, "Warning: Invalid NTP sync interval, using default (60 seconds)\n");
+                    ntp_sync_interval = 60;
+                }
+            } else if (strcmp(long_options[opt_index].name, "ntp-slew-period") == 0) {
+                ntp_slew_period = atoi(optarg);
+                if (ntp_slew_period < 1) {
+                    fprintf(stderr, "Warning: Invalid NTP slew period, using default (30 seconds)\n");
+                    ntp_slew_period = 30;
+                }
+            }
         } else switch (opt) {
             case 'd':
                 pcm_device = optarg;
@@ -284,6 +132,9 @@ int main(int argc, char *argv[]) {
         const framerate_spec_t* cfg_rate = parse_rate(config_framerate);
         if (cfg_rate) rate = cfg_rate;
     }
+    
+    // Update the global selected_fps variable with the actual frame rate
+    selected_fps = rate->fps;
 
     // If not explicitly quiet and running interactively, show timecode display
     int show_timecode_display = !quiet && is_console_interactive();
@@ -305,7 +156,20 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    pin_to_core(3);
+    // Default to core 3, but allow overriding via config
+    int cpu_core = 3;
+    char cpu_core_str[32] = "";
+    
+    // Check config for CPU core setting
+    if (get_config_value("cpu-core", cpu_core_str, sizeof(cpu_core_str))) {
+        cpu_core = atoi(cpu_core_str);
+    }
+    
+    // Pin to specified CPU core (use -1 to disable)
+    pin_to_core(cpu_core);
+    
+    // Lock memory to prevent paging which can cause latency spikes
+    lock_memory();
 
     // ALSA setup
     snd_pcm_t *pcm;
@@ -314,29 +178,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    snd_pcm_hw_params_t *params;
-    snd_pcm_hw_params_alloca(&params);
-    snd_pcm_hw_params_any(pcm, params);
-    snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S16_LE);
-    snd_pcm_hw_params_set_channels(pcm, params, CHANNELS);
-    unsigned int alsa_rate = SAMPLE_RATE;
-    snd_pcm_hw_params_set_rate_near(pcm, params, &alsa_rate, 0);
-
     // Calculate frame size for output FPS
     int ltc_frame_size = (int)round((double)SAMPLE_RATE / rate->fps);
 
-    // Large buffer and period for reliability
-    snd_pcm_uframes_t buffer_size = ltc_frame_size * 32;
-    snd_pcm_uframes_t period_size = ltc_frame_size;
-    snd_pcm_hw_params_set_buffer_size_near(pcm, params, &buffer_size);
-    snd_pcm_hw_params_set_period_size_near(pcm, params, &period_size, 0);
-
-    if (snd_pcm_hw_params(pcm, params) < 0) {
-        fprintf(stderr, "Failed to set PCM hardware parameters\n");
+    // Use our optimized ALSA configuration for low latency
+    if (configure_alsa_for_low_latency(pcm, SAMPLE_RATE, ltc_frame_size) < 0) {
+        fprintf(stderr, "Failed to configure ALSA for low latency\n");
         return 1;
     }
-    snd_pcm_prepare(pcm);
 
     LTCEncoder *encoder = ltc_encoder_create((double)SAMPLE_RATE, rate->fps, rate->std, rate->drop_frame);
     if (!encoder) {
@@ -359,6 +208,8 @@ int main(int argc, char *argv[]) {
     // Start display thread if interactive
     pthread_t disp_thread;
     if (show_timecode_display) {
+        // Pass PCM handle to display thread so it can display accurate timecode
+        display.pcm = pcm;
         pthread_create(&disp_thread, NULL, timecode_display_thread, &display);
     }
 
@@ -372,6 +223,35 @@ int main(int argc, char *argv[]) {
 
     // Set real-time priority for audio (main) thread
     set_realtime_priority();
+    
+    // Start NTP synchronization thread if a server is specified
+    pthread_t ntp_thread;
+    if (use_ntp && strlen(ntp_server) > 0) {
+        if (show_timecode_display) {
+            printf("Using NTP server: %s for timecode synchronization\n", ntp_server);
+        }
+        // Initial NTP sync
+        if (query_ntp_server(ntp_server) == 0) {
+            if (show_timecode_display) {
+                printf("Initial NTP sync successful with server %s, target offset: %" PRId64 " microseconds\n", 
+                       ntp_server, ntp_target_offset_us);
+            }
+        } else {
+            fprintf(stderr, "Initial NTP sync failed with server %s\n", ntp_server);
+        }
+        
+        // Set up arguments for NTP sync thread
+        ntp_thread_args_t *ntp_args = malloc(sizeof(ntp_thread_args_t));
+        if (ntp_args == NULL) {
+            fprintf(stderr, "Failed to allocate memory for NTP thread arguments\n");
+            return 1;
+        }
+        ntp_args->server = ntp_server;
+        ntp_args->display_enabled = show_timecode_display;
+        
+        // Start thread for periodic NTP sync
+        pthread_create(&ntp_thread, NULL, ntp_sync_thread, ntp_args);
+    }
 
     // Main loop: output LTC to ALSA, update display state
     while (running) {
@@ -401,12 +281,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Update timecode for display (non-blocking)
-        if (show_timecode_display) {
-            pthread_mutex_lock(&display.lock);
-            display.tc = tc;
-            pthread_mutex_unlock(&display.lock);
-        }
+        // Display updates are now handled by the display thread
     }
 
     // Cleanup
@@ -414,12 +289,20 @@ int main(int argc, char *argv[]) {
     if (show_timecode_display) {
         pthread_join(disp_thread, NULL);
     }
+    
+    // Wait for NTP thread if it was started
+    if (use_ntp && strlen(ntp_server) > 0) {
+        pthread_join(ntp_thread, NULL);
+    }
+    
     ltc_encoder_free(encoder);
     free(frame);
     free(ltc_buf);
     snd_pcm_drain(pcm);
     snd_pcm_close(pcm);
     pthread_mutex_destroy(&display.lock);
+    pthread_mutex_destroy(&ntp_lock);
+    
     if (show_timecode_display) {
         printf("Exited gracefully.\n");
     }
