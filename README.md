@@ -18,7 +18,7 @@
 
 ## Disclaimer
 
-**This software has not been tested for accuracy or reliability in critical or professional environments. It is provided "as is", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, or noninfringement.  
+**This software has not been validated for accuracy or reliability in critical or professional settings.** Based on side-by-side testing with a Blackmagic Studio 4K G2 camera using the camera’s internal NTP time-of-day timecode, ltc_timecode_pi output (on Raspberry Pi 2 with onboard audio) appears to achieve approximately 1–2 frame accuracy; however, it has not been tested beyond this. **The software is provided “as is”, without any warranty—express or implied—including, but not limited to, warranties of merchantability, fitness for a particular purpose, or noninfringement.
 Use at your own risk.**
 
 ## Build Instructions
@@ -96,7 +96,6 @@ Example config file:
 ```
 device=hw:CARD=Device,DEV=0         # ALSA device name
 framerate=30                        # Frame rate (24, 25, 29.97, 30, 29.97df, 30df)
-cpu-core=3                          # CPU core to pin process to (use -1 to disable)
 ntp-server=pool.ntp.org             # NTP server for time synchronization
 ntp-sync-interval=60                # NTP sync interval in seconds
 ntp-slew-period=30                  # Time adjustment period in seconds
@@ -144,15 +143,20 @@ ntp-slew-period=60     # gradually adjust time over 60 seconds
 
 You can install and enable `ltc_timecode_pi` as a systemd service using the provided Makefile:
 
+0. **Compile the binary if not already done:**
+   ```sh
+   make
+   ```
+
 1. **Install the binary and service:**
    ```sh
    sudo make install
    ```
    This will:
-   - Build and copy the `ltc_timecode_pi` binary to `/usr/local/bin/`
+   - Copy the `ltc_timecode_pi` binary to `/usr/local/bin/`
    - Install the systemd service file to `/etc/systemd/system/ltc_timecode_pi.service`
-   - Install a systemd timer to `/etc/systemd/system/ltc_timecode_pi.timer` (for delayed startup)
-   - Install an example config file to `/etc/ltc_timecode_pi.conf` (if it doesn't exist)
+   - Install a systemd timer to `/etc/systemd/system/ltc_timecode_pi.timer` (for delayed startup, this gives the system time to get the sound card ready)
+   - Install the example config file to `/etc/ltc_timecode_pi.conf` (if it doesn't exist)
    - Create a system user `ltc` (if it doesn't exist) and add it to the audio group
    - Reload systemd units
 
@@ -161,7 +165,7 @@ You can install and enable `ltc_timecode_pi` as a systemd service using the prov
    sudo systemctl enable ltc_timecode_pi.timer
    sudo systemctl start ltc_timecode_pi.timer
    ```
-   This will start the service with a delay after boot to ensure the sound system is ready.
+   This will start the service with a delay after boot to ensure the sound devices are ready.
 
 3. **Or start the service immediately without the timer:**
    ```sh
@@ -183,13 +187,13 @@ You can install and enable `ltc_timecode_pi` as a systemd service using the prov
    ```sh
    sudo make uninstall
    ```
-   This will stop and disable the service and timer, and remove all installed files.
+   This will stop and disable the service and timer, and remove all installed files (the `ltc` user and config file will not be removed).
 
 You can adjust the configuration at `/etc/ltc_timecode_pi.conf` to set your device, framerate, and NTP server.
 
 ## Technical Details: Timing Correction
 
-For an in-depth explanation of the advanced timing correction techniques used to achieve precise LTC output—including hardware optimizations, ALSA buffer compensation, and adaptive mathematical correction—see [docs/TIMING.md](docs/TIMING.md).
+For an in-depth explanation of the advanced timing correction techniques used to achieve precise LTC output - including hardware optimizations, ALSA buffer compensation, and adaptive mathematical correction; see [docs/TIMING.md](docs/TIMING.md).
 
 ## License
 
